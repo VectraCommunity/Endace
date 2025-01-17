@@ -19,6 +19,9 @@ import vectra_official as vectra
 from datetime import datetime, timedelta, timezone
 import logging
 import requests
+import keyring
+import getpass
+
 from typing import Dict, Optional
 from itertools import product
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -37,10 +40,18 @@ __status__ = "Production"
 logging.basicConfig(level=logging.INFO)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-VECTRA_APPLIANCE_URL = 'https://<BRAIN_FQDN>'
-API_TOKEN = 'youneedanapikeyforthistowork'
+# If using APIv2 set this
+VECTRA_APPLIANCE_URL = None # Example: 'https://vectra.local'
+
+# If using APIv3 set this
+VECTRA_PORTAL_URL = None # Example: 'https://000000000000.ew1.portal.vectra.ai'
+CLIENT_ID = ''
+
+# Configure Endace endpoint
 ENDACE_URL = 'https://endace.example.com'
 
+# If you need to reset credentials, set to True and run
+RESET = False
 
 class HTTPException(Exception):
     def __init__(self, response):
@@ -85,7 +96,7 @@ class VectraDetection:
 DetectionDict = Dict[int, VectraDetection] 
 
 
-class VectraAPIWrapper(vectra.VectraClientV2_2):
+class VectraAPIWrapper():
 
     @staticmethod
     def _get_dict_keys_relative_complement(dict1, dict2):
@@ -98,15 +109,15 @@ class VectraAPIWrapper(vectra.VectraClientV2_2):
                 result_dict[key] = value
         return result_dict
 
-    def __init__(self, url=None, token=None, verify=False):
+    def __init__(self, vectra_api_client):
         """
         Initialize Vectra client
-        :param url: IP or hostname of Vectra brain - required
-        :param token: API token for authentication - required
-        :param verify: verify SSL - optional
+        :param version: API Version to use - required
+        :param url: Vectra Appliance or Portal URL - required
+        :param client_id: APIv3 client id, only required for APIv3 - optional
         """
-        vectra.VectraClientV2_2.__init__(self, url=url, token=token, verify=verify)
         self.logger = logging.getLogger('VectraClient')
+        self.vac = vectra_api_client
 
     def _get_tagged_detections(self, tag: str) -> DetectionDict:
         """
@@ -115,10 +126,8 @@ class VectraAPIWrapper(vectra.VectraClientV2_2):
         :rtype: DetectionDict
         """
         detections = {}
-        r = self.get_all_detections(tags=tag)
+        r = self.vac.get_all_detections(tags=tag)
         for page in r:
-            if page.status_code not in [200, 201, 204]:
-                raise HTTPException(page)
             for detection in page.json().get('results', []):
                 if tag in detection['tags']: # for some reason the API does substring matching, so we check
                     detections[detection['id']] = VectraDetection(detection)
@@ -130,10 +139,8 @@ class VectraAPIWrapper(vectra.VectraClientV2_2):
         :rtype: DetectionDict
         """
         detections = {}
-        r = self.get_all_detections(state='active')
+        r = self.vac.get_all_detections(state='active')
         for page in r:
-            if page.status_code not in [200, 201, 204]:
-                raise HTTPException(page)
             for detection in page.json().get('results', []):
                 detections[detection['id']] = VectraDetection(detection)
         return detections
@@ -144,7 +151,7 @@ class VectraAPIWrapper(vectra.VectraClientV2_2):
         :param: detection_id
         :rtype: Optional int
         """
-        r = self.get_detection_note(detection_id=detection_id)
+        r = self.vac.get_detection_note(detection_id=detection_id)
         for note in r.json():
             if "Endace" in note['note']:
                 return note
@@ -215,22 +222,46 @@ class EndaceClient(object):
                 )
         return link
 
+def version_check(pwd_dict):
+    if VECTRA_APPLIANCE_URL:
+        api_token = keyring.get_password(service_name = VECTRA_APPLIANCE_URL, username='api_token')
+        if not api_token or RESET:
+            api_token = getpass.getpass(prompt="Enter your Vectra APIv2 Token: ")
+            keyring.set_password(service_name = VECTRA_APPLIANCE_URL, username='api_token', password=api_token)
+        pwd_dict['api_token'] = api_token
+        return 2
+    elif VECTRA_PORTAL_URL:
+        secret_key = keyring.get_password(service_name = VECTRA_PORTAL_URL, username='secret_key')
+        if not secret_key or RESET:
+            secret_key = getpass.getpass(prompt="Enter your Vectra APIv3 Secret Key: ")
+            keyring.set_password(service_name = VECTRA_PORTAL_URL, username='secret_key', password=secret_key)
+        pwd_dict['secret_key'] = secret_key
+        return 3
+    else:
+        raise ValueError('You need to specify either an appliance or portal URL')
+
 if __name__ == "__main__":
     logger = logging.getLogger()
-    vac = VectraAPIWrapper(url=VECTRA_APPLIANCE_URL, token=API_TOKEN)
+    # pass a mutable object to the function to get around python not having pointers
+    pwd_dict = {'api_token':None, 'secret_key':None}
+    version = version_check(pwd_dict)
+    if version == 2:
+        vaw = VectraAPIWrapper(vectra.VectraClientV2_4(url=VECTRA_APPLIANCE_URL, token=pwd_dict['api_token'], verify=False))
+    elif version == 3:
+        vaw = VectraAPIWrapper(vectra.VectraClientV3(url=VECTRA_PORTAL_URL, client_id=CLIENT_ID, client_secret=pwd_dict['secret_key'], verify=False))
     ec = EndaceClient(url=ENDACE_URL)
-    detections_to_enrich = vac.get_all_detections_to_enrich()
-    detections_to_update = vac.get_all_detections_to_update()
+    detections_to_enrich = vaw.get_all_detections_to_enrich()
+    detections_to_update = vaw.get_all_detections_to_update()
 
     for detection_id, detection in detections_to_enrich.items():
         link = ec.generate_endace_link(detection)
         note = "Endace link: [click here]({})".format(link)
         # Create the note
-        vac.set_detection_note(detection_id, note)
+        vaw.vac.set_detection_note(detection_id, note)
         logger.info('Added Endace note/link to detection ID {}'.format(str(detection_id)))
         logger.debug('Link is: {}'.format(link))
         # Set tag for tracking
-        vac.set_detection_tags(detection_id=detection_id, tags=['Endace'], append=True)
+        vaw.vac.set_detection_tags(detection_id=detection_id, tags=['Endace'], append=True)
         logger.debug('Added Endace tag to detection ID {}'.format(str(detection_id)))
     
     for detection_id, detection in detections_to_update.items():
@@ -238,7 +269,7 @@ if __name__ == "__main__":
         link = ec.generate_endace_link(detection)
         note = "Endace link: [click here]({})".format(link)
         # Update the note
-        vac.update_detection_note(detection_id=detection_id, note_id=detection.note_id, note=note)
+        vaw.vac.update_detection_note(detection_id=detection_id, note_id=detection.note_id, note=note)
         logger.info('Updated Endace note/link to detection ID {}'.format(str(detection_id)))
         logger.debug('Link is: {}'.format(link))
 
